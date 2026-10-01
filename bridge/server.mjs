@@ -17,6 +17,7 @@
 
 import { WebSocketServer } from 'ws'
 import { query } from '@anthropic-ai/claude-agent-sdk'
+import { Agent, MemorySession, run } from '@openai/agents'
 import { displayServer } from './panels.mjs'
 import { uiServer } from './ui.mjs'
 import { chromeAvailable, chromeServer } from './chrome.mjs'
@@ -29,6 +30,8 @@ import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
 import { probeUrl, renderPage } from './page.mjs'
 
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
+const PROVIDER = (process.env.JARVIS_PROVIDER ?? 'claude').toLowerCase()
+const OPENAI_MODEL = process.env.JARVIS_OPENAI_MODEL ?? 'gpt-5.6-luna'
 
 /**
  * A crash here takes the whole assistant down mid-sentence, and most of what
@@ -1045,7 +1048,10 @@ wss.on('connection', (socket) => {
   // Answer the HUD straight away rather than making it wait for the agent's
   // first turn. Refined later by the real init message.
   socket.send(
-    JSON.stringify({ type: 'ready', servers: Object.keys(MCP_SERVERS) }),
+    JSON.stringify({
+      type: 'ready',
+      servers: PROVIDER === 'openai' ? [] : Object.keys(MCP_SERVERS),
+    }),
   )
 
   /** Resolves the pending user message into the SDK's input generator. */
@@ -1085,6 +1091,57 @@ wss.on('connection', (socket) => {
    */
   let answering = null
   const sendTurn = (msg) => send({ ...msg, ask: answering })
+
+  if (PROVIDER === 'openai') {
+    const agent = new Agent({
+      name: 'JARVIS',
+      instructions: SYSTEM_PROMPT,
+      model: OPENAI_MODEL,
+    })
+    const memory = new MemorySession()
+    let controller = null
+    let chain = Promise.resolve()
+
+    socket.on('message', (raw) => {
+      let msg
+      try {
+        msg = JSON.parse(raw.toString())
+      } catch {
+        return
+      }
+
+      if (msg.type === 'ask' && typeof msg.text === 'string') {
+        const text = msg.text
+        const id = typeof msg.id === 'string' ? msg.id : null
+        chain = chain.then(async () => {
+          answering = id
+          controller = new AbortController()
+          try {
+            const result = await run(agent, text, {
+              session: memory,
+              maxTurns: 8,
+              signal: controller.signal,
+            })
+            const output = String(result.finalOutput ?? '')
+            if (output) sendTurn({ type: 'text', delta: output })
+            sendTurn({ type: 'done', text: output, costUsd: null })
+          } catch (err) {
+            if (controller?.signal.aborted) return
+            console.error('[jarvis] OpenAI turn failed:', err)
+            sendTurn({ type: 'error', message: String(err?.message ?? err) })
+          } finally {
+            controller = null
+          }
+        })
+      }
+
+      if (msg.type === 'interrupt') controller?.abort()
+    })
+
+    socket.on('close', () => controller?.abort())
+    console.log(`[jarvis] OpenAI provider ready · model ${OPENAI_MODEL}`)
+    return
+  }
 
   /**
    * Asking the browser for something and waiting for the answer.
